@@ -7,9 +7,12 @@ type ConfigV2 struct {
 	ModelFamilies []string `json:"model_families"`
 	ModelType     string   `json:"model_type"` // shown as Parameter Size
 	FileType      string   `json:"file_type"`  // shown as Quantization Level
-	Renderer      string   `json:"renderer,omitempty"`
-	Parser        string   `json:"parser,omitempty"`
-	Requires      string   `json:"requires,omitempty"`
+	// GenerationDefaults stores model-authored sampler defaults. These are
+	// lower precedence than Modelfile PARAMETERs and request options.
+	GenerationDefaults GenerationDefaults `json:"generation_defaults,omitempty"`
+	Renderer           string             `json:"renderer,omitempty"`
+	Parser             string             `json:"parser,omitempty"`
+	Requires           string             `json:"requires,omitempty"`
 
 	RemoteHost  string `json:"remote_host,omitempty"`
 	RemoteModel string `json:"remote_model,omitempty"`
@@ -19,15 +22,17 @@ type ConfigV2 struct {
 	ContextLen   int      `json:"context_length,omitempty"`
 	EmbedLen     int      `json:"embedding_length,omitempty"`
 	BaseName     string   `json:"base_name,omitempty"`
+	Draft        *Draft   `json:"draft,omitempty"`
 
 	// required by spec
 	Architecture string `json:"architecture"`
 	OS           string `json:"os"`
-	RootFS       RootFS `json:"rootfs"`
 }
 
-// RootFS represents the root filesystem configuration for a model.
-type RootFS struct {
-	Type    string   `json:"type"`
-	DiffIDs []string `json:"diff_ids"`
+// Draft describes an auxiliary draft model stored in the same manifest.
+type Draft struct {
+	ModelFormat  string `json:"model_format,omitempty"`
+	Architecture string `json:"architecture,omitempty"`
+	TensorPrefix string `json:"tensor_prefix,omitempty"`
+	Config       string `json:"config,omitempty"`
 }

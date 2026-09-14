@@ -30,9 +30,7 @@ const (
 	gemma4StringDelimiter  = `<|"|>`
 )
 
-var (
-	gemma4QuotedStringRe = regexp.MustCompile(`(?s)<\|"\|>(.*?)<\|"\|>`)
-)
+var gemma4QuotedStringRe = regexp.MustCompile(`(?s)<\|"\|>(.*?)<\|"\|>`)
 
 type Gemma4Parser struct {
 	state                 Gemma4ParserState
@@ -52,6 +50,17 @@ func (p *Gemma4Parser) HasThinkingSupport() bool {
 	return p.hasThinkingSupport
 }
 
+func (p *Gemma4Parser) PreservedTokens() []string {
+	return []string{
+		gemma4ThinkingOpenTag,
+		gemma4ThinkingCloseTag,
+		gemma4ToolCallOpenTag,
+		gemma4ToolCallCloseTag,
+		gemma4ToolResponseTag,
+		gemma4StringDelimiter,
+	}
+}
+
 func (p *Gemma4Parser) Init(tools []api.Tool, lastMessage *api.Message, thinkValue *api.ThinkValue) []api.Tool {
 	p.tools = tools
 	p.callIndex = 0
@@ -62,6 +71,12 @@ func (p *Gemma4Parser) Init(tools []api.Tool, lastMessage *api.Message, thinkVal
 
 	if !p.thinkingEnabled {
 		p.state = Gemma4CollectingContent
+		return tools
+	}
+
+	if lastMessage != nil && lastMessage.Role == "tool" {
+		p.state = Gemma4CollectingThinking
+		p.needsChannelNameStrip = false
 		return tools
 	}
 

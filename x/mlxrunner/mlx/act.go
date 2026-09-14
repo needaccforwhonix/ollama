@@ -25,11 +25,46 @@ var GELUApprox = Compile1(
 	Shapeless(),
 )
 
+func gelu(x *Array) *Array {
+	dt := x.DType()
+	half := FromValue[float32](0.5).AsType(dt)
+	one := FromValue[float32](1).AsType(dt)
+	invSqrt2 := FromValue(float32(1 / math.Sqrt2)).AsType(dt)
+	return half.Multiply(x).Multiply(one.Add(erf(x.Multiply(invSqrt2))))
+}
+
+// GELU returns the exact erf formulation used by torch.nn.functional.gelu.
+var GELU = Compile1("GELU", gelu, Shapeless())
+
 // SiLU returns a * sigmoid(a) as a fused kernel.
 var SiLU = Compile1(
 	"SiLU",
 	func(a *Array) *Array {
 		return a.Multiply(a.Sigmoid())
+	},
+	Shapeless(),
+)
+
+// ReLUSquared returns relu(x)^2 as a fused kernel.
+var ReLUSquared = Compile1(
+	"ReLUSquared",
+	func(x *Array) *Array {
+		zero := FromValue[float32](0).AsType(x.DType())
+		x = Maximum(x, zero)
+		return x.Multiply(x)
+	},
+	Shapeless(),
+)
+
+// SoftplusF32 returns softplus(x) computed in float32 precision and cast back
+// to x's original dtype, as a fused kernel. Matches the laguna attention
+// output-gate formula: softplus(cast_f32(x)).cast(orig_dtype).
+var SoftplusF32 = Compile1(
+	"SoftplusF32",
+	func(x *Array) *Array {
+		dt := x.DType()
+		zero := FromValue[float32](0)
+		return Logaddexp(x.AsType(DTypeFloat32), zero).AsType(dt)
 	},
 	Shapeless(),
 )

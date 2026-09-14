@@ -3,6 +3,7 @@ package gemma4
 import (
 	"testing"
 
+	"github.com/ollama/ollama/x/internal/mlxtest"
 	"github.com/ollama/ollama/x/mlxrunner/mlx"
 )
 
@@ -11,11 +12,8 @@ func onesLike(shape ...int) *mlx.Array {
 	return mlx.AddScalar(mlx.Zeros(mlx.DTypeBFloat16, shape...), 0.01)
 }
 
-func TestMoEForward(t *testing.T) {
-	skipIfNoMLX(t)
-
-	// Small config matching 26b architecture pattern.
-	cfg := &TextConfig{
+func tinyMoEConfig() *TextConfig {
+	return &TextConfig{
 		HiddenSize:             16, // tiny for testing
 		NumAttentionHeads:      2,
 		NumKeyValueHeads:       1,
@@ -31,17 +29,31 @@ func TestMoEForward(t *testing.T) {
 		SlidingScale:           1.0,
 		FullScale:              1.0,
 	}
+}
 
-	B, L := int32(1), int32(3)
-	x := onesLike(int(B), int(L), int(cfg.HiddenSize))
-
-	// Test Router.Forward.
-	router := &Router{
+func newRouter(cfg *TextConfig) *Router {
+	return &Router{
 		Proj:  linearFromWeight(onesLike(int(cfg.NumExperts), int(cfg.HiddenSize))),
 		Scale: onesLike(int(cfg.HiddenSize)),
 	}
+}
 
-	t.Run("Router", func(t *testing.T) {
+func newMoEBlock(cfg *TextConfig) *MoEBlock {
+	return &MoEBlock{
+		GateWeight:     onesLike(int(cfg.NumExperts), int(cfg.HiddenSize), int(cfg.ExpertIntermediateSize)),
+		UpWeight:       onesLike(int(cfg.NumExperts), int(cfg.HiddenSize), int(cfg.ExpertIntermediateSize)),
+		DownWeight:     onesLike(int(cfg.NumExperts), int(cfg.ExpertIntermediateSize), int(cfg.HiddenSize)),
+		PerExpertScale: onesLike(int(cfg.NumExperts)),
+	}
+}
+
+func TestMoERouterForward(t *testing.T) {
+	mlxtest.Run(t, func(t *mlxtest.T) {
+		cfg := tinyMoEConfig()
+		B, L := int32(1), int32(3)
+		x := onesLike(int(B), int(L), int(cfg.HiddenSize))
+		router := newRouter(cfg)
+
 		scores, inds := router.Forward(x, cfg)
 		mlx.Eval(scores, inds)
 
@@ -56,16 +68,16 @@ func TestMoEForward(t *testing.T) {
 			t.Errorf("inds shape = %v, want [%d, %d]", iDims, B*L, cfg.TopKExperts)
 		}
 	})
+}
 
-	// Test MoEBlock.Forward.
-	moe := &MoEBlock{
-		GateWeight:     onesLike(int(cfg.NumExperts), int(cfg.HiddenSize), int(cfg.ExpertIntermediateSize)),
-		UpWeight:       onesLike(int(cfg.NumExperts), int(cfg.HiddenSize), int(cfg.ExpertIntermediateSize)),
-		DownWeight:     onesLike(int(cfg.NumExperts), int(cfg.ExpertIntermediateSize), int(cfg.HiddenSize)),
-		PerExpertScale: onesLike(int(cfg.NumExperts)),
-	}
+func TestMoEBlockForward(t *testing.T) {
+	mlxtest.Run(t, func(t *mlxtest.T) {
+		cfg := tinyMoEConfig()
+		B, L := int32(1), int32(3)
+		x := onesLike(int(B), int(L), int(cfg.HiddenSize))
+		router := newRouter(cfg)
+		moe := newMoEBlock(cfg)
 
-	t.Run("MoEBlock", func(t *testing.T) {
 		scores, inds := router.Forward(x, cfg)
 		mlx.Eval(scores, inds)
 
@@ -79,23 +91,109 @@ func TestMoEForward(t *testing.T) {
 			t.Errorf("output shape = %v, want [%d, %d, %d]", outDims, B, L, cfg.HiddenSize)
 		}
 	})
+}
 
-	// Test with larger batch to exercise the sorted GatherMM path (B*L >= 64).
-	t.Run("MoEBlock_sorted", func(t *testing.T) {
-		bigB, bigL := int32(1), int32(128)
-		bigX := onesLike(int(bigB), int(bigL), int(cfg.HiddenSize))
+func TestMoEBlockSortedForward(t *testing.T) {
+	mlxtest.Run(t, func(t *mlxtest.T) {
+		cfg := tinyMoEConfig()
+		B, L := int32(1), int32(128)
+		x := onesLike(int(B), int(L), int(cfg.HiddenSize))
+		router := newRouter(cfg)
+		moe := newMoEBlock(cfg)
 
-		scores, inds := router.Forward(bigX, cfg)
+		scores, inds := router.Forward(x, cfg)
 		mlx.Eval(scores, inds)
 
-		out := moe.Forward(bigX, scores, inds, cfg)
+		out := moe.Forward(x, scores, inds, cfg)
 		mlx.Eval(out)
 
 		outDims := out.Dims()
 		t.Logf("MoE sorted output shape: %v", outDims)
 
-		if len(outDims) != 3 || outDims[0] != int(bigB) || outDims[1] != int(bigL) || outDims[2] != int(cfg.HiddenSize) {
-			t.Errorf("output shape = %v, want [%d, %d, %d]", outDims, bigB, bigL, cfg.HiddenSize)
+		if len(outDims) != 3 || outDims[0] != int(B) || outDims[1] != int(L) || outDims[2] != int(cfg.HiddenSize) {
+			t.Errorf("output shape = %v, want [%d, %d, %d]", outDims, B, L, cfg.HiddenSize)
+		}
+	})
+}
+
+// TestLoadFusedExpertsQuantized verifies that a quantized, fused gate_up
+// projection is loaded onto the GatherQMM path under every name the experts
+// ship as — including gemma's bare ".experts." name, which previously fell
+// through to the dense branch and was loaded unquantized (the memory bloat
+// bug this fix addresses).
+func TestLoadFusedExpertsQuantized(t *testing.T) {
+	mlxtest.SkipIfUnavailable(t)
+
+	const E, I, H = 4, 8, 16
+	m := &Model{TextConfig: &TextConfig{QuantGroupSize: 16, QuantBits: 4, QuantMode: "nvfp4"}}
+
+	for _, prefix := range []string{
+		"model.language_model.layers.0.experts",        // gemma HF (bare .experts.)
+		"model.language_model.layers.0.moe.switch_mlp", // create pipeline
+	} {
+		mlxtest.RunSubtest(t, prefix, func(t *mlxtest.T) {
+			gateUpKey := prefix + ".gate_up_proj"
+			downKey := prefix + ".down_proj"
+			tensors := map[string]*mlx.Array{
+				gateUpKey:            onesLike(E, 2*I, H),
+				gateUpKey + "_scale": onesLike(E, 2*I, H/16),
+				gateUpKey + "_qbias": onesLike(E, 2*I, H/16),
+				downKey:              onesLike(E, H, I),
+				downKey + "_scale":   onesLike(E, H, I/16),
+				downKey + "_qbias":   onesLike(E, H, I/16),
+			}
+
+			moe := &MoEBlock{}
+			m.loadFusedExperts(moe, tensors, gateUpKey, tensors[gateUpKey], downKey, tensors[downKey])
+
+			if !moe.UseQuantized {
+				t.Error("UseQuantized = false, want true")
+			}
+			if !moe.UseFusedGateUp {
+				t.Error("UseFusedGateUp = false, want true")
+			}
+			if moe.GateUpWeightQ == nil || moe.GateUpScales == nil || moe.GateUpBiases == nil {
+				t.Error("quantized gate_up weight/scale/bias not all set")
+			}
+			if moe.DownWeightQ == nil || moe.DownScales == nil || moe.DownBiases == nil {
+				t.Error("quantized down weight/scale/bias not all set")
+			}
+			// Dense fields must stay nil so Forward takes the GatherQMM path.
+			if moe.GateUpWeight != nil || moe.DownWeight != nil {
+				t.Error("dense weights set on a quantized block")
+			}
+		})
+	}
+}
+
+// TestLoadFusedExpertsDense verifies that a fused gate_up projection with no
+// scale companions is loaded onto the dense GatherMM path, kept fused.
+func TestLoadFusedExpertsDense(t *testing.T) {
+	mlxtest.Run(t, func(t *mlxtest.T) {
+		const E, I, H = 4, 8, 16
+		m := &Model{TextConfig: &TextConfig{}}
+
+		gateUpKey := "model.language_model.layers.0.experts.gate_up_proj"
+		downKey := "model.language_model.layers.0.experts.down_proj"
+		tensors := map[string]*mlx.Array{
+			gateUpKey: onesLike(E, 2*I, H),
+			downKey:   onesLike(E, I, H),
+		}
+
+		moe := &MoEBlock{}
+		m.loadFusedExperts(moe, tensors, gateUpKey, tensors[gateUpKey], downKey, tensors[downKey])
+
+		if moe.UseQuantized {
+			t.Error("UseQuantized = true, want false (no scales present)")
+		}
+		if !moe.UseFusedGateUp {
+			t.Error("UseFusedGateUp = false, want true")
+		}
+		if moe.GateUpWeight == nil || moe.DownWeight == nil {
+			t.Error("dense fused weights not set")
+		}
+		if moe.GateUpWeightQ != nil || moe.DownWeightQ != nil {
+			t.Error("quantized weights set on a dense block")
 		}
 	})
 }
@@ -106,54 +204,54 @@ func TestMoEForward(t *testing.T) {
 // normalized scores as the legacy path that softmaxes over every expert
 // first, gathers the top-k probabilities, then renormalizes.
 func TestRouterForwardMatchesLegacy(t *testing.T) {
-	skipIfNoMLX(t)
+	mlxtest.Run(t, func(t *mlxtest.T) {
+		cfg := &TextConfig{
+			HiddenSize:  8,
+			NumExperts:  4,
+			TopKExperts: 2,
+			RMSNormEps:  1e-6,
+			RouterScale: 0.5,
+		}
 
-	cfg := &TextConfig{
-		HiddenSize:  8,
-		NumExperts:  4,
-		TopKExperts: 2,
-		RMSNormEps:  1e-6,
-		RouterScale: 0.5,
-	}
+		// Distinct per-expert weight rows so top-k has a well-defined ordering
+		// (tied scores would let argpartition pick either tied expert and make
+		// the index comparison below flaky).
+		projWeight := mlx.FromValues([]float32{
+			0.10, 0.11, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17, // expert 0
+			0.30, 0.29, 0.28, 0.27, 0.26, 0.25, 0.24, 0.23, // expert 1
+			-0.05, -0.06, -0.07, -0.08, -0.09, -0.10, -0.11, -0.12, // expert 2
+			0.50, 0.48, 0.46, 0.44, 0.42, 0.40, 0.38, 0.36, // expert 3
+		}, int(cfg.NumExperts), int(cfg.HiddenSize))
 
-	// Distinct per-expert weight rows so top-k has a well-defined ordering
-	// (tied scores would let argpartition pick either tied expert and make
-	// the index comparison below flaky).
-	projWeight := mlx.FromValues([]float32{
-		0.10, 0.11, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17, // expert 0
-		0.30, 0.29, 0.28, 0.27, 0.26, 0.25, 0.24, 0.23, // expert 1
-		-0.05, -0.06, -0.07, -0.08, -0.09, -0.10, -0.11, -0.12, // expert 2
-		0.50, 0.48, 0.46, 0.44, 0.42, 0.40, 0.38, 0.36, // expert 3
-	}, int(cfg.NumExperts), int(cfg.HiddenSize))
+		scale := mlx.FromValues([]float32{
+			1.0, 0.9, 1.1, 1.0, 1.2, 0.8, 1.0, 1.05,
+		}, int(cfg.HiddenSize))
 
-	scale := mlx.FromValues([]float32{
-		1.0, 0.9, 1.1, 1.0, 1.2, 0.8, 1.0, 1.05,
-	}, int(cfg.HiddenSize))
+		r := &Router{
+			Proj:  linearFromWeight(projWeight),
+			Scale: scale,
+		}
 
-	r := &Router{
-		Proj:  linearFromWeight(projWeight),
-		Scale: scale,
-	}
+		// Varied x so different positions potentially hit different top-k.
+		x := mlx.FromValues([]float32{
+			0.2, -0.1, 0.3, 0.0, 0.4, -0.2, 0.1, 0.05,
+			-0.3, 0.2, -0.1, 0.4, -0.05, 0.3, 0.0, 0.2,
+			0.5, 0.4, -0.2, 0.1, -0.3, 0.0, 0.3, -0.1,
+		}, 1, 3, int(cfg.HiddenSize))
 
-	// Varied x so different positions potentially hit different top-k.
-	x := mlx.FromValues([]float32{
-		0.2, -0.1, 0.3, 0.0, 0.4, -0.2, 0.1, 0.05,
-		-0.3, 0.2, -0.1, 0.4, -0.05, 0.3, 0.0, 0.2,
-		0.5, 0.4, -0.2, 0.1, -0.3, 0.0, 0.3, -0.1,
-	}, 1, 3, int(cfg.HiddenSize))
+		gotScores, gotInds := r.Forward(x, cfg)
+		wantScores, wantInds := legacyRouterForward(r, x, cfg)
+		gotInds = gotInds.AsType(mlx.DTypeInt32)
+		wantInds = wantInds.AsType(mlx.DTypeInt32)
+		mlx.Eval(gotScores, gotInds, wantScores, wantInds)
 
-	gotScores, gotInds := r.Forward(x, cfg)
-	wantScores, wantInds := legacyRouterForward(r, x, cfg)
-	gotInds = gotInds.AsType(mlx.DTypeInt32)
-	wantInds = wantInds.AsType(mlx.DTypeInt32)
-	mlx.Eval(gotScores, gotInds, wantScores, wantInds)
-
-	if got, want := gotInds.Ints(), wantInds.Ints(); !intSlicesEqual(got, want) {
-		t.Fatalf("indices mismatch:\n  got  %v\n  want %v", got, want)
-	}
-	if got, want := gotScores.Floats(), wantScores.Floats(); !floatSlicesClose(got, want, 1e-5) {
-		t.Fatalf("scores mismatch:\n  got  %v\n  want %v", got, want)
-	}
+		if got, want := gotInds.Ints(), wantInds.Ints(); !intSlicesEqual(got, want) {
+			t.Fatalf("indices mismatch:\n  got  %v\n  want %v", got, want)
+		}
+		if got, want := gotScores.Floats(), wantScores.Floats(); !floatSlicesClose(got, want, 1e-5) {
+			t.Fatalf("scores mismatch:\n  got  %v\n  want %v", got, want)
+		}
+	})
 }
 
 // legacyRouterForward implements the pre-optimization router: full softmax
@@ -184,7 +282,7 @@ func legacyRouterForward(r *Router, x *mlx.Array, cfg *TextConfig) (*mlx.Array, 
 	return scores, inds
 }
 
-func intSlicesEqual(a, b []int) bool {
+func intSlicesEqual(a, b []int32) bool {
 	if len(a) != len(b) {
 		return false
 	}

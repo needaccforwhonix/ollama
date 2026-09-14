@@ -1,6 +1,6 @@
 module github.com/ollama/ollama
 
-go 1.24.1
+go 1.26.0
 
 require (
 	github.com/TheTitanrain/w32 v0.0.0-20180517000239-4f5cfb03fabf
@@ -24,12 +24,13 @@ require (
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/d4l3k/go-bfloat16 v0.0.0-20211005043715-690c3bdd05f1
-	github.com/dlclark/regexp2 v1.11.4
+	github.com/dlclark/regexp2 v1.11.5
 	github.com/emirpasic/gods/v2 v2.0.0-alpha
 	github.com/klauspost/compress v1.18.3
 	github.com/mattn/go-runewidth v0.0.16
 	github.com/nlpodyssey/gopickle v0.3.0
 	github.com/pdevine/tensor v0.0.0-20240510204454-f88f4562727c
+	github.com/pelletier/go-toml/v2 v2.2.2
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c
 	github.com/tkrajina/typescriptify-golang-structs v0.2.0
 	github.com/tree-sitter/go-tree-sitter v0.25.0
@@ -37,7 +38,6 @@ require (
 	github.com/wk8/go-ordered-map/v2 v2.1.8
 	golang.org/x/image v0.22.0
 	golang.org/x/mod v0.30.0
-	golang.org/x/tools v0.38.0
 	gonum.org/v1/gonum v0.15.0
 )
 
@@ -62,7 +62,7 @@ require (
 	github.com/kr/text v0.2.0 // indirect
 	github.com/lucasb-eyer/go-colorful v1.2.0 // indirect
 	github.com/mailru/easyjson v0.7.7 // indirect
-	github.com/mattn/go-localereader v0.0.1 // indirect
+	github.com/mattn/go-localereader v0.0.2-0.20220822084737-6bae6c923850 // indirect
 	github.com/mattn/go-pointer v0.0.1 // indirect
 	github.com/muesli/ansi v0.0.0-20230316100256-276c6243b2f6 // indirect
 	github.com/muesli/cancelreader v0.2.2 // indirect
@@ -95,7 +95,6 @@ require (
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
-	github.com/pelletier/go-toml/v2 v2.2.2 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
 	github.com/ugorji/go/codec v1.2.12 // indirect

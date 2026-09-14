@@ -23,7 +23,6 @@ import (
 
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/envconfig"
-	"github.com/ollama/ollama/fs/gguf"
 	"github.com/ollama/ollama/manifest"
 	"github.com/ollama/ollama/model/parsers"
 	"github.com/ollama/ollama/parser"
@@ -31,7 +30,8 @@ import (
 	"github.com/ollama/ollama/thinking"
 	"github.com/ollama/ollama/types/model"
 	"github.com/ollama/ollama/version"
-	"github.com/ollama/ollama/x/imagegen/transfer"
+	"github.com/ollama/ollama/x/mlxrunner/mlx"
+	"github.com/ollama/ollama/x/transfer"
 )
 
 // Blobs newer than this may belong to another process that has not written its
@@ -61,113 +61,470 @@ type registryOptions struct {
 }
 
 type Model struct {
-	Name           string `json:"name"`
-	Config         model.ConfigV2
-	ShortName      string
-	ModelPath      string
-	ParentModel    string
-	AdapterPaths   []string
-	ProjectorPaths []string
-	System         string
-	License        []string
-	Digest         string
-	Options        map[string]any
-	Messages       []api.Message
+	Name               string `json:"name"`
+	Config             model.ConfigV2
+	ShortName          string
+	ModelPath          string
+	DraftPath          string
+	ParentModel        string
+	HasChatTemplate    bool
+	HasGoTemplate      bool
+	PreferChatTemplate bool // set when GGUF chat_template should take precedence over Go TEMPLATE
+	AdapterPaths       []string
+	ProjectorPaths     []string
+	System             string
+	License            []string
+	Digest             string
+	Options            map[string]any
+	GenerationDefaults model.GenerationDefaults
+	Messages           []api.Message
 
 	Template *template.Template
+
+	// Metadata of the model blob and of each projector, read from their
+	// metadata files when the model is loaded.
+	metadata          ggufMetadata
+	projectorMetadata []ggufMetadata
 }
 
 func (m *Model) IsMLX() bool {
 	return m.Config.ModelFormat == "safetensors"
 }
 
+func (m *Model) isGGUF() bool {
+	return m.Config.ModelFormat == "" || m.Config.ModelFormat == "gguf"
+}
+
+func generationDefaultsFromMetadata(md ggufMetadata) model.GenerationDefaults {
+	return model.ParseGGUFGenerationDefaults(
+		func(key string) (int64, bool) {
+			n, ok := md.number(key)
+			if !ok {
+				return 0, false
+			}
+			if value, err := n.Int64(); err == nil {
+				return value, true
+			}
+			value, err := n.Float64()
+			if err != nil {
+				return 0, false
+			}
+			return int64(value), true
+		},
+		func(key string) (float64, bool) {
+			n, ok := md.number(key)
+			if !ok {
+				return 0, false
+			}
+			value, err := n.Float64()
+			return value, err == nil
+		},
+	)
+}
+
+func appendCapability(capabilities []model.Capability, capability model.Capability) []model.Capability {
+	if slices.Contains(capabilities, capability) {
+		return capabilities
+	}
+	return append(capabilities, capability)
+}
+
+type templateCapabilitySource int
+
+const (
+	templateCapabilitySelected templateCapabilitySource = iota
+	templateCapabilityGo
+	templateCapabilityChat
+)
+
 // Capabilities returns the capabilities that the model supports
 func (m *Model) Capabilities() []model.Capability {
-	capabilities := []model.Capability{}
-
-	if m.ModelPath != "" {
-		f, err := gguf.Open(m.ModelPath)
-		if err == nil {
-			defer f.Close()
-
-			if f.KeyValue("pooling_type").Valid() {
-				capabilities = append(capabilities, model.CapabilityEmbedding)
-			} else {
-				// If no embedding is specified, we assume the model supports completion
-				capabilities = append(capabilities, model.CapabilityCompletion)
-			}
-			if f.KeyValue("vision.block_count").Valid() {
-				capabilities = append(capabilities, model.CapabilityVision)
-			}
-			if f.KeyValue("audio.block_count").Valid() {
-				capabilities = append(capabilities, model.CapabilityAudio)
-			}
-		} else {
-			slog.Error("couldn't open model file", "error", err)
-		}
-	}
-
-	// Also include capabilities from the model config (e.g. vision capability
-	// set during creation for MLX/safetensors models).
-	if len(m.Config.Capabilities) > 0 {
-		for _, c := range m.Config.Capabilities {
-			cap := model.Capability(c)
-			if !slices.Contains(capabilities, cap) {
-				capabilities = append(capabilities, cap)
-			}
-		}
-	}
-
+	capabilities := m.capabilitiesForTemplate(templateCapabilitySelected)
 	if len(capabilities) == 0 {
 		slog.Warn("unknown capabilities for model", "model", m.Name)
 	}
 
-	if m.Template == nil {
+	return capabilities
+}
+
+func (m *Model) capabilitiesForTemplate(source templateCapabilitySource) []model.Capability {
+	capabilities := []model.Capability{}
+	var modelArch string
+
+	capabilities = m.configCapabilities(capabilities)
+	capabilities, modelArch = m.ggufCapabilities(capabilities, source)
+	capabilities = m.projectorCapabilities(capabilities)
+	capabilities = m.templateCapabilities(capabilities, source)
+	capabilities = m.parserCapabilities(capabilities)
+	capabilities = m.modelFamilyCapabilities(capabilities)
+	capabilities = m.filterUnsupportedCapabilities(capabilities, modelArch)
+
+	return capabilities
+}
+
+func (m *Model) configCapabilities(capabilities []model.Capability) []model.Capability {
+	for _, c := range m.Config.Capabilities {
+		capabilities = appendCapability(capabilities, model.Capability(c))
+	}
+	return capabilities
+}
+
+func (m *Model) ggufCapabilities(capabilities []model.Capability, source templateCapabilitySource) ([]model.Capability, string) {
+	if m.ModelPath == "" || !m.isGGUF() {
+		return capabilities, ""
+	}
+
+	switch source {
+	case templateCapabilitySelected:
+		if !usesOllamaRenderedChat(m) {
+			capabilities = chatTemplateCapabilities(capabilities, m.metadata.String("tokenizer.chat_template"))
+		}
+	case templateCapabilityChat:
+		capabilities = chatTemplateCapabilities(capabilities, m.metadata.String("tokenizer.chat_template"))
+	}
+	if m.metadata.Valid("pooling_type") {
+		capabilities = appendCapability(capabilities, model.CapabilityEmbedding)
+	} else {
+		// If no embedding is specified, we assume the model supports completion.
+		capabilities = appendCapability(capabilities, model.CapabilityCompletion)
+	}
+	if m.metadata.Valid("vision.block_count") {
+		capabilities = appendCapability(capabilities, model.CapabilityVision)
+	}
+	if m.metadata.Valid("audio.block_count") {
+		capabilities = appendCapability(capabilities, model.CapabilityAudio)
+	}
+
+	return capabilities, m.metadata.String("general.architecture")
+}
+
+func chatTemplateCapabilities(capabilities []model.Capability, chatTemplate string) []model.Capability {
+	if chatTemplate == "" {
 		return capabilities
 	}
 
-	builtinParser := parsers.ParserForName(m.Config.Parser)
-	// Check for tools capability
-	v, err := m.Template.Vars()
+	if chatTemplateHasToolSupport(chatTemplate) {
+		capabilities = appendCapability(capabilities, model.CapabilityTools)
+	}
+	if chatTemplateHasThinkingSupport(chatTemplate) {
+		capabilities = appendCapability(capabilities, model.CapabilityThinking)
+	}
+
+	return capabilities
+}
+
+func chatTemplateHasToolSupport(chatTemplate string) bool {
+	return strings.Contains(chatTemplate, "tools") || strings.Contains(chatTemplate, "tool_call")
+}
+
+func chatTemplateHasToolRoundTrip(chatTemplate string) bool {
+	if !chatTemplateHasToolSupport(chatTemplate) {
+		return false
+	}
+
+	toolCalls := strings.Contains(chatTemplate, "tool_calls") || strings.Contains(chatTemplate, "assistant_tool_call")
+	return toolCalls && (strings.Contains(chatTemplate, "tool_response") ||
+		strings.Contains(chatTemplate, "tool_results") ||
+		strings.Contains(chatTemplate, "role'] == 'tool'") ||
+		strings.Contains(chatTemplate, `role'] == "tool"`) ||
+		strings.Contains(chatTemplate, `role"] == 'tool'`) ||
+		strings.Contains(chatTemplate, `role"] == "tool"`) ||
+		strings.Contains(chatTemplate, `message.role == 'tool'`) ||
+		strings.Contains(chatTemplate, `message.role == "tool"`) ||
+		strings.Contains(chatTemplate, "ipython"))
+}
+
+func chatTemplateHasThinkingSupport(chatTemplate string) bool {
+	if strings.Contains(chatTemplate, "<think>") && strings.Contains(chatTemplate, "</think>") {
+		return true
+	}
+
+	// Some Qwen/DeepSeek templates strip prior reasoning by splitting assistant
+	// content at </think>; llama.cpp can still extract reasoning from them.
+	return (strings.Contains(chatTemplate, "content.split('</think>')") ||
+		strings.Contains(chatTemplate, `content.split("</think>")`)) &&
+		!strings.Contains(chatTemplate, "reasoning_content") &&
+		!strings.Contains(chatTemplate, "<SPECIAL_12>")
+}
+
+func goTemplateCapabilities(t *template.Template) []model.Capability {
+	if t == nil {
+		return nil
+	}
+
+	v, err := t.Vars()
 	if err != nil {
 		slog.Warn("model template contains errors", "error", err)
-	}
-	if slices.Contains(v, "tools") || (builtinParser != nil && builtinParser.HasToolSupport()) {
-		capabilities = append(capabilities, model.CapabilityTools)
+		return nil
 	}
 
-	// Check for insert capability
+	var capabilities []model.Capability
+	if slices.Contains(v, "tools") {
+		capabilities = appendCapability(capabilities, model.CapabilityTools)
+	}
 	if slices.Contains(v, "suffix") {
-		capabilities = append(capabilities, model.CapabilityInsert)
+		capabilities = appendCapability(capabilities, model.CapabilityInsert)
 	}
 
-	// Check for vision capability in projector-based models
-	if len(m.ProjectorPaths) > 0 {
-		capabilities = append(capabilities, model.CapabilityVision)
+	openingTag, closingTag := thinking.InferTags(t.Template)
+	if openingTag != "" && closingTag != "" {
+		capabilities = appendCapability(capabilities, model.CapabilityThinking)
 	}
 
-	// Skip the thinking check if it's already set
-	if slices.Contains(capabilities, "thinking") {
+	return capabilities
+}
+
+func goTemplateHasToolRoundTrip(t *template.Template) bool {
+	if t == nil {
+		return false
+	}
+
+	v, err := t.Vars()
+	if err != nil || !slices.Contains(v, "tools") || !slices.Contains(v, "toolcalls") {
+		return false
+	}
+
+	raw := t.String()
+	return strings.Contains(raw, `eq .Role "tool"`) ||
+		strings.Contains(raw, "tool_response") ||
+		strings.Contains(raw, "TOOL_RESULTS")
+}
+
+func hasMoreCapabilities(candidate, current []model.Capability) bool {
+	return len(candidate) > len(current)
+}
+
+func sameCapabilities(candidate, current []model.Capability) bool {
+	if len(candidate) != len(current) {
+		return false
+	}
+	for _, c := range candidate {
+		if !slices.Contains(current, c) {
+			return false
+		}
+	}
+	return true
+}
+
+func shouldPreferChatTemplate(chatTemplate string, chatTemplateCaps []model.Capability, goTemplate *template.Template, goTemplateCaps []model.Capability) bool {
+	if hasMoreCapabilities(chatTemplateCaps, goTemplateCaps) {
+		return !goTemplateHasToolRoundTrip(goTemplate) || chatTemplateHasToolRoundTrip(chatTemplate)
+	}
+
+	if !sameCapabilities(chatTemplateCaps, goTemplateCaps) ||
+		!slices.Contains(chatTemplateCaps, model.CapabilityTools) ||
+		!slices.Contains(goTemplateCaps, model.CapabilityTools) {
+		return false
+	}
+
+	return chatTemplateHasToolRoundTrip(chatTemplate) && !goTemplateHasToolRoundTrip(goTemplate)
+}
+
+func goTemplateEnvSet() bool {
+	return envconfig.GoTemplate(true) == envconfig.GoTemplate(false)
+}
+
+func capabilityNames(capabilities []model.Capability) []string {
+	names := make([]string, 0, len(capabilities))
+	for _, capability := range capabilities {
+		names = append(names, string(capability))
+	}
+
+	return names
+}
+
+func selectedTemplateSource(m *Model, usesHarmony bool) string {
+	switch {
+	case m.Config.Renderer != "" && m.Config.Parser != "":
+		return "renderer_parser"
+	case m.Config.Renderer != "":
+		return "renderer"
+	case m.Config.Parser != "":
+		return "parser"
+	case usesHarmony:
+		return "harmony"
+	case shouldUseGoTemplate(m):
+		return "go_template"
+	case m.HasChatTemplate:
+		return "gguf_chat_template"
+	default:
+		return "none"
+	}
+}
+
+func capabilityLogValue(present bool, capabilities []model.Capability) any {
+	if !present {
+		return "null"
+	}
+
+	return capabilityNames(capabilities)
+}
+
+func (m *Model) templateSelectionCapabilities(usesHarmony bool) (goTemplate, chatTemplate, harmony, rendererParser []model.Capability) {
+	if m.HasGoTemplate {
+		goTemplate = m.capabilitiesForTemplate(templateCapabilityGo)
+	}
+	if m.HasChatTemplate {
+		chatTemplate = m.capabilitiesForTemplate(templateCapabilityChat)
+	}
+	if usesHarmony {
+		harmony = m.capabilitiesForTemplate(templateCapabilitySelected)
+	}
+	if m.Config.Renderer != "" || m.Config.Parser != "" {
+		rendererParser = m.capabilitiesForTemplate(templateCapabilitySelected)
+	}
+
+	return goTemplate, chatTemplate, harmony, rendererParser
+}
+
+func logTemplateSelection(m *Model) {
+	usesHarmony := m.Template != nil && shouldUseHarmony(m)
+	goTemplateCapabilities, chatTemplateCapabilities, harmonyCapabilities, rendererParserCapabilities := m.templateSelectionCapabilities(usesHarmony)
+
+	slog.Info("template selection",
+		"model", m.Name,
+		"selected", selectedTemplateSource(m, usesHarmony),
+		"renderer", m.Config.Renderer,
+		"parser", m.Config.Parser,
+		"go_template", capabilityLogValue(m.HasGoTemplate, goTemplateCapabilities),
+		"chat_template", capabilityLogValue(m.HasChatTemplate, chatTemplateCapabilities),
+		"harmony", capabilityLogValue(usesHarmony, harmonyCapabilities),
+		"renderer_parser", capabilityLogValue(m.Config.Renderer != "" || m.Config.Parser != "", rendererParserCapabilities),
+	)
+}
+
+func (m *Model) projectorCapabilities(capabilities []model.Capability) []model.Capability {
+	if len(m.ProjectorPaths) == 0 {
 		return capabilities
 	}
 
-	// Check for thinking capability
-	openingTag, closingTag := thinking.InferTags(m.Template.Template)
-	hasTags := openingTag != "" && closingTag != ""
-	isGptoss := slices.Contains([]string{"gptoss", "gpt-oss"}, m.Config.ModelFamily)
-	if hasTags || isGptoss || (builtinParser != nil && builtinParser.HasThinkingSupport()) {
-		capabilities = append(capabilities, model.CapabilityThinking)
+	capabilities = appendCapability(capabilities, model.CapabilityVision)
+	for _, md := range m.projectorMetadata {
+		if projectorHasAudio(md) && !projectorSuppressesAudioCapability(md) {
+			capabilities = appendCapability(capabilities, model.CapabilityAudio)
+		}
 	}
 
-	// Temporary workaround — suppress vision/audio for gemma4 MLX models
-	// until multimodal runtime pipeline lands. Remove when imageproc.go is wired up.
-	if m.Config.ModelFormat == "safetensors" && isGemma4Renderer(m.Config.Renderer) {
+	return capabilities
+}
+
+func (m *Model) templateCapabilities(capabilities []model.Capability, source templateCapabilitySource) []model.Capability {
+	switch source {
+	case templateCapabilitySelected:
+		if m.HasGoTemplate && !shouldUseGoTemplate(m) {
+			return capabilities
+		}
+	case templateCapabilityGo:
+		if !m.HasGoTemplate {
+			return capabilities
+		}
+	case templateCapabilityChat:
+		return capabilities
+	}
+
+	for _, capability := range goTemplateCapabilities(m.Template) {
+		capabilities = appendCapability(capabilities, capability)
+	}
+
+	return capabilities
+}
+
+func (m *Model) parserCapabilities(capabilities []model.Capability) []model.Capability {
+	builtinParser := parsers.ParserForName(m.Config.Parser)
+	if builtinParser == nil {
+		return capabilities
+	}
+
+	if builtinParser.HasToolSupport() {
+		capabilities = appendCapability(capabilities, model.CapabilityTools)
+	}
+	if builtinParser.HasThinkingSupport() {
+		capabilities = appendCapability(capabilities, model.CapabilityThinking)
+	}
+
+	return capabilities
+}
+
+func (m *Model) modelFamilyCapabilities(capabilities []model.Capability) []model.Capability {
+	isGptoss := slices.Contains([]string{"gptoss", "gpt-oss"}, m.Config.ModelFamily)
+	if isGptoss {
+		capabilities = appendCapability(capabilities, model.CapabilityThinking)
+	}
+
+	return capabilities
+}
+
+func (m *Model) filterUnsupportedCapabilities(capabilities []model.Capability, modelArch string) []model.Capability {
+	if suppressAudioCapability(m, modelArch) {
 		capabilities = slices.DeleteFunc(capabilities, func(c model.Capability) bool {
-			return c == model.CapabilityVision || c == "audio"
+			return c == model.CapabilityAudio
+		})
+	}
+	if suppressVisionCapability(m) {
+		capabilities = slices.DeleteFunc(capabilities, func(c model.Capability) bool {
+			return c == model.CapabilityVision
 		})
 	}
 
 	return capabilities
+}
+
+func suppressVisionCapability(m *Model) bool {
+	// The current MLX Nemotron path is text-only. Do not advertise vision for
+	// safetensors manifests until the runner can load and serve that modality.
+	return isNemotron3NanoSafetensors(m)
+}
+
+func suppressAudioCapability(m *Model, arch string) bool {
+	if m.Config.ModelFormat == "safetensors" && m.Config.Renderer == "glimmer" {
+		return true
+	}
+	if isNemotron3NanoSafetensors(m) {
+		return true
+	}
+
+	if arch == "nemotron_h_omni" ||
+		m.Config.ModelFamily == "nemotron_h_omni" ||
+		slices.Contains(m.Config.ModelFamilies, "nemotron_h_omni") {
+		// TODO: expose Nemotron3 audio once llama.cpp can skip or load the audio projector safely.
+		return true
+	}
+
+	return false
+}
+
+func isNemotron3NanoSafetensors(m *Model) bool {
+	return isNemotron3NanoSafetensorsConfig(m.Config)
+}
+
+func isNemotron3NanoSafetensorsConfig(cfg model.ConfigV2) bool {
+	return cfg.ModelFormat == "safetensors" &&
+		(cfg.Parser == "nemotron-3-nano" ||
+			cfg.Renderer == "nemotron-3-nano" ||
+			cfg.ModelFamily == "nemotron_h_omni" ||
+			slices.Contains(cfg.ModelFamilies, "nemotron_h_omni"))
+}
+
+func projectorHasAudio(md ggufMetadata) bool {
+	// read directly: Keys reports qualified keys, the accessors qualify theirs
+	for _, key := range md.Keys() {
+		if key == "has_audio_encoder" || strings.HasSuffix(key, ".has_audio_encoder") {
+			if b, ok := md.KV[key].(bool); ok && b {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func projectorSuppressesAudioCapability(md ggufMetadata) bool {
+	switch md.String("vision.projector_type") {
+	case "gemma3nv":
+		return true
+	}
+
+	return false
 }
 
 // CheckCapabilities checks if the model has the specified capabilities returning an error describing
@@ -227,6 +584,13 @@ func (m *Model) String() string {
 		modelfile.Commands = append(modelfile.Commands, parser.Command{
 			Name: "adapter",
 			Args: adapter,
+		})
+	}
+
+	if m.DraftPath != "" {
+		modelfile.Commands = append(modelfile.Commands, parser.Command{
+			Name: "draft",
+			Args: m.DraftPath,
 		})
 	}
 
@@ -328,9 +692,19 @@ func GetModel(name string) (*Model, error) {
 		if err := json.NewDecoder(configFile).Decode(&m.Config); err != nil {
 			return nil, err
 		}
+		m.GenerationDefaults = m.Config.GenerationDefaults
 	}
 
+	modelHasPooling := false
+	ggufChatTemplate := ""
 	for _, layer := range mf.Layers {
+		// Nothing below reads a tensor layer, and resolving a path costs a
+		// syscall each. Named rather than allowlisting the types below, so a new
+		// layer type is slower here instead of silently unread.
+		if layer.MediaType == manifest.MediaTypeImageTensor {
+			continue
+		}
+
 		filename, err := manifest.BlobsPath(layer.Digest)
 		if err != nil {
 			return nil, err
@@ -340,6 +714,20 @@ func GetModel(name string) (*Model, error) {
 		case "application/vnd.ollama.image.model":
 			m.ModelPath = filename
 			m.ParentModel = layer.From
+			if m.isGGUF() {
+				md, err := readGGUFMetadata(layer.Digest)
+				if err != nil {
+					slog.Error("couldn't read model metadata", "error", err)
+					break
+				}
+				m.metadata = md
+				ggufChatTemplate = md.String("tokenizer.chat_template")
+				m.HasChatTemplate = ggufChatTemplate != ""
+				modelHasPooling = md.Valid("pooling_type")
+				m.GenerationDefaults = generationDefaultsFromMetadata(md)
+			}
+		case manifest.MediaTypeImageDraft:
+			m.DraftPath = filename
 		case "application/vnd.ollama.image.embed":
 			// Deprecated in versions  > 0.1.2
 			// TODO: remove this warning in a future version
@@ -348,8 +736,14 @@ func GetModel(name string) (*Model, error) {
 			m.AdapterPaths = append(m.AdapterPaths, filename)
 		case "application/vnd.ollama.image.projector":
 			m.ProjectorPaths = append(m.ProjectorPaths, filename)
+			if md, err := readGGUFMetadata(layer.Digest); err != nil {
+				slog.Error("couldn't read projector metadata", "error", err)
+			} else {
+				m.projectorMetadata = append(m.projectorMetadata, md)
+			}
 		case "application/vnd.ollama.image.prompt",
 			"application/vnd.ollama.image.template":
+			m.HasGoTemplate = true
 			bts, err := os.ReadFile(filename)
 			if err != nil {
 				return nil, err
@@ -394,6 +788,17 @@ func GetModel(name string) (*Model, error) {
 			}
 			m.License = append(m.License, string(bts))
 		}
+	}
+
+	ggufCaps := chatTemplateCapabilities(nil, ggufChatTemplate)
+	goCaps := goTemplateCapabilities(m.Template)
+	usesHarmony := m.Template != nil && shouldUseHarmony(m)
+	if !goTemplateEnvSet() && m.HasGoTemplate && ggufChatTemplate != "" && m.Config.Renderer == "" && m.Config.Parser == "" && !usesHarmony && shouldPreferChatTemplate(ggufChatTemplate, ggufCaps, m.Template, goCaps) {
+		m.PreferChatTemplate = true
+	}
+
+	if m.ModelPath != "" && m.isGGUF() && !modelHasPooling && !m.HasChatTemplate && (!m.HasGoTemplate || !envconfig.GoTemplate(true)) && m.Config.Renderer == "" && m.Config.Parser == "" && !usesHarmony {
+		slog.Warn("model is missing tokenizer.chat_template and Go TEMPLATE support is unavailable; chat responses may be poorly formatted", "model", m.Name, "env", "OLLAMA_GO_TEMPLATE=1")
 	}
 
 	return m, nil
@@ -460,10 +865,11 @@ func deleteUnusedLayers(deleteMap map[string]struct{}) error {
 			slog.Info(fmt.Sprintf("couldn't get file path for '%s': %v", k, err))
 			continue
 		}
-		if err := os.Remove(fp); err != nil {
+		if err := os.Remove(fp); err != nil && !errors.Is(err, os.ErrNotExist) {
 			slog.Info(fmt.Sprintf("couldn't remove file '%s': %v", fp, err))
 			continue
 		}
+		removeGGUFMetadata(k)
 	}
 
 	return nil
@@ -520,6 +926,7 @@ func PruneLayers() error {
 		slog.Error(fmt.Sprintf("couldn't remove unused layers: %v", err))
 		return nil
 	}
+	pruneGGUFMetadata()
 
 	slog.Info(fmt.Sprintf("total unused blobs removed: %d", len(deleteMap)))
 
@@ -622,6 +1029,12 @@ func PullModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 	if err != nil {
 		return fmt.Errorf("pull model manifest: %s", err)
 	}
+	if hasTensorLayers(mf.Layers) {
+		if err := mlx.CheckInit(); err != nil {
+			slog.Debug("MLX is unavailable for safetensors model pull", "error", err)
+			return errors.New("this model requires MLX support, but the MLX runtime is not available")
+		}
+	}
 
 	var layers []manifest.Layer
 	layers = append(layers, mf.Layers...)
@@ -649,7 +1062,16 @@ func PullModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 		if err != nil {
 			return err
 		}
-		skipVerify[layer.Digest] = cacheHit
+		// If any download of a given digest was not a cache hit,
+		// always verify it. Without this guard, a config entry
+		// sharing a digest with a layer can overwrite the layer's
+		// false (needs verification) with true (cache hit), since
+		// the blob now exists on disk from the first download.
+		if existing, ok := skipVerify[layer.Digest]; !ok {
+			skipVerify[layer.Digest] = cacheHit
+		} else {
+			skipVerify[layer.Digest] = existing && cacheHit
+		}
 		delete(deleteMap, layer.Digest)
 	}
 
@@ -667,6 +1089,7 @@ func PullModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 				if err := os.Remove(fp); err != nil {
 					slog.Info(fmt.Sprintf("couldn't remove file with digest mismatch '%s': %v", fp, err))
 				}
+				removeGGUFMetadata(layer.Digest)
 			}
 			return err
 		}
@@ -761,14 +1184,15 @@ func pullWithTransfer(ctx context.Context, n model.Name, layers []manifest.Layer
 	}
 
 	if err := transfer.Download(ctx, transfer.DownloadOptions{
-		Blobs:      blobs,
-		BaseURL:    baseURL,
-		DestDir:    destDir,
-		Repository: n.DisplayNamespaceModel(),
-		Progress:   progress,
-		Token:      regOpts.Token,
-		GetToken:   getToken,
-		Logger:     slog.Default(),
+		Blobs:           blobs,
+		BaseURL:         baseURL,
+		DestDir:         destDir,
+		Repository:      n.DisplayNamespaceModel(),
+		BodyConcurrency: max(1, int(envconfig.MaxTransferStreams())),
+		Progress:        progress,
+		Token:           regOpts.Token,
+		GetToken:        getToken,
+		Logger:          slog.Default(),
 	}); err != nil {
 		return err
 	}
@@ -837,16 +1261,17 @@ func pushWithTransfer(ctx context.Context, n model.Name, layers []manifest.Layer
 	}
 
 	return transfer.Upload(ctx, transfer.UploadOptions{
-		Blobs:       blobs,
-		BaseURL:     baseURL,
-		SrcDir:      srcDir,
-		Progress:    progress,
-		Token:       regOpts.Token,
-		GetToken:    getToken,
-		Logger:      slog.Default(),
-		Manifest:    manifestJSON,
-		ManifestRef: n.Tag,
-		Repository:  n.DisplayNamespaceModel(),
+		Blobs:           blobs,
+		BaseURL:         baseURL,
+		SrcDir:          srcDir,
+		BodyConcurrency: max(1, int(envconfig.MaxTransferStreams())),
+		Progress:        progress,
+		Token:           regOpts.Token,
+		GetToken:        getToken,
+		Logger:          slog.Default(),
+		Manifest:        manifestJSON,
+		ManifestRef:     n.Tag,
+		Repository:      n.DisplayNamespaceModel(),
 	})
 }
 
